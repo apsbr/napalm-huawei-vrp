@@ -191,8 +191,8 @@ class VRPDriver(NetworkDriver):
         """
 
         cli_output = dict()
-        if type(commands) is not list:
-            raise TypeError("Please enter a valid list of commands!")
+        if not isinstance(commands, (list, tuple)):
+            raise TypeError("Please enter a valid list or tuple of commands!")
 
         for command in commands:
             output = self.device.send_command(command)
@@ -971,6 +971,12 @@ class VRPDriver(NetworkDriver):
         re_mac = (
             r"(?P<mac>\S+)\s+(?P<vlan>\d+|-)\S+\s+(?P<interface>\S+)\s+(?P<type>\w+)\s+"
         )
+        lines = [
+            line
+            for line in output.splitlines()
+            if re.match(r"^(?:[0-9A-Fa-f]{4}-){2}[0-9A-Fa-f]{4}\s", line)
+        ]
+        output = "\n".join(lines)
         match = re.findall(re_mac, output, re.M)
 
         for mac_info in match:
