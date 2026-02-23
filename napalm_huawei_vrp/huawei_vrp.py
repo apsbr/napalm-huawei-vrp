@@ -2050,12 +2050,16 @@ class VRPDriver(NetworkDriver):
         try:
             output += self.device.send_command("system-view", expect_string=r"\[.+\]")
             for command in commands:
-                # Handle specific interactive commands that prompt for confirmation
+                # Handle specific commands that might prompt for confirmation depending on OS version
                 if "local-user" in command and "privilege level 1" in command:
-                    # Send command and expect a Yes/No prompt (case-insensitive regex)
-                    output += self.device.send_command(command, expect_string=r"[Yy]/[Nn]")
-                    # Confirm the action with 'y' and wait to return to the system-view prompt
-                    output += self.device.send_command("y", expect_string=r"\[.+\]")
+                    # Send command and wait for EITHER a Yes/No prompt OR the standard prompt
+                    cmd_output = self.device.send_command(command, expect_string=r"([Yy]/[Nn]|\[.+\])")
+                    output += cmd_output
+                    
+                    # Check if the device actually asked for confirmation
+                    if re.search(r"[Yy]/[Nn]", cmd_output):
+                        # Confirm the action and wait to return to the system-view prompt
+                        output += self.device.send_command("y", expect_string=r"\[.+\]")    
                 else:
                     # Standard execution for non-interactive commands
                     output += self.device.send_command(command, expect_string=r"\[.+\]")
