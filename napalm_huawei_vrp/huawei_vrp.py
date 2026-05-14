@@ -1918,22 +1918,35 @@ class VRPDriver(NetworkDriver):
     def get_vlans(self):
         """Return VLANs configured on the device.
 
+        Supports both VRP and YunShan (CloudEngine) output formats.
+
         The return value follows the NAPALM ``get_vlans`` schema::
 
             {
                 "1": {
                     "name": "default",
-                    "interfaces": ["TenGigabitEthernet1/2/15"]
+                    "interfaces": ["GE1/0/1"],
+                    "tagged_interfaces": ["GE1/0/23"]
                 }
             }
+
+        ``interfaces`` contains untagged (access) ports; ``tagged_interfaces``
+        contains tagged (trunk) ports.  The VRP parser only populates
+        ``interfaces`` because the VRP brief output does not distinguish
+        tagged from untagged ports.
         """
-        vlans = {}
-        command = "show vlan all-ports"
-        output = self.device.send_command(command)
+        output = self.device.send_command("display vlan")
 
         if not output:
-            return vlans
+            return {}
 
+        if re.search(r"VID\s+(?:Type\s+)?Ports\b", output):
+            return self._get_vlans_yunshan(output)
+        return self._get_vlans_vrp(output)
+
+    def _get_vlans_vrp(self, output):
+        """Parse VRP ``display vlan`` output."""
+        vlans = {}
         current_vlan = None
 
         for line in output.splitlines():
@@ -1961,6 +1974,7 @@ class VRPDriver(NetworkDriver):
                     "interfaces": self._get_vlans_parse_interfaces(
                         vlan_match.group("ports")
                     ),
+                    "tagged_interfaces": [],
                 }
                 current_vlan = vlan_id
                 continue
@@ -1972,6 +1986,129 @@ class VRPDriver(NetworkDriver):
                 )
 
         return vlans
+
+    @staticmethod
+    def _get_vlans_yunshan(output):
+        """Parse YunShan (CloudEngine) ``display vlan`` output.
+
+        The command produces two sections:
+
+        1. **Ports section** — VID with ``UT:`` (untagged) or ``TG:`` (tagged)
+           port lists, with optional indented continuation lines.
+        2. **Description section** — VID with type, status and a free-text
+           description used as the VLAN name.
+
+        Example (abbreviated)::
+
+            VID          Ports
+            -----------------------------------------------
+               1         UT:GE1/0/1(D)      GE1/0/2(D)
+                            GE1/0/3(D)
+             700         TG:GE1/0/23(U)     GE1/0/24(D)
+
+            VID  Type     Status  Property  MAC-LRN STAT    BC  MC  UC  Description
+            -----------------------------------------------
+               1 common   enable  default   enable  disable FWD FWD FWD VLAN 0001
+             700 common   enable  default   enable  disable FWD FWD FWD video
+        """
+        vlans = {}
+
+        STATE_NONE = 0
+        STATE_PORTS = 1
+        STATE_DESC = 2
+
+        state = STATE_NONE
+        current_vlan = None
+        current_tag_type = None
+        desc_fixed_fields = 0
+
+        for line in output.splitlines():
+            stripped = line.strip()
+
+            # Detect start of each section via its header line.
+            if re.match(r"^VID\s+(?:Type\s+)?Ports\b", stripped):
+                state = STATE_PORTS
+                current_vlan = None
+                continue
+
+            if re.match(r"^VID\s+Type\s+Status\b", stripped):
+                state = STATE_DESC
+                current_vlan = None
+                desc_fixed_fields = 8
+                continue
+
+            if re.match(r"^VID\s+Status\b", stripped):
+                state = STATE_DESC
+                current_vlan = None
+                desc_fixed_fields = 4
+                continue
+
+            # Skip blank lines and separator rows (---).
+            if not stripped or stripped.startswith("-"):
+                if state == STATE_PORTS:
+                    current_vlan = None
+                continue
+
+            if state == STATE_PORTS:
+                # New VID line: "   1         UT:GE1/0/1(D)  GE1/0/2(D)"
+                vlan_line_match = re.match(
+                    r"^\s*(\d+)(?:\s+\S+)?\s+(UT|TG|MP|ST):(.*)$", line
+                )
+                if vlan_line_match:
+                    current_vlan = vlan_line_match.group(1)
+                    current_tag_type = vlan_line_match.group(2)
+                    ports_str = vlan_line_match.group(3)
+                    if current_vlan not in vlans:
+                        vlans[current_vlan] = {
+                            "name": "",
+                            "interfaces": [],
+                            "tagged_interfaces": [],
+                        }
+                    ports = VRPDriver._parse_yunshan_ports(ports_str)
+                    if current_tag_type == "UT":
+                        vlans[current_vlan]["interfaces"].extend(ports)
+                    else:
+                        vlans[current_vlan]["tagged_interfaces"].extend(ports)
+
+                elif line.startswith(" ") and current_vlan is not None:
+                    # Indented continuation line with more ports.
+                    ports = VRPDriver._parse_yunshan_ports(stripped)
+                    if current_tag_type == "UT":
+                        vlans[current_vlan]["interfaces"].extend(ports)
+                    else:
+                        vlans[current_vlan]["tagged_interfaces"].extend(ports)
+
+            elif state == STATE_DESC:
+                # "   1 common   enable  default   enable  disable FWD FWD FWD VLAN 0001"
+                # Fields: VID  Type  Status  Property  MAC-LRN  STAT  BC  MC  UC  Description
+                parts = stripped.split(None, desc_fixed_fields + 1)
+                if len(parts) >= desc_fixed_fields + 2 and parts[0].isdigit():
+                    vlan_id = parts[0]
+                    name = parts[desc_fixed_fields + 1].strip()
+                    if vlan_id in vlans:
+                        vlans[vlan_id]["name"] = name
+                    else:
+                        vlans[vlan_id] = {
+                            "name": name,
+                            "interfaces": [],
+                            "tagged_interfaces": [],
+                        }
+
+        return vlans
+
+    @staticmethod
+    def _parse_yunshan_ports(ports_str):
+        """Extract port names from a YunShan space-separated port token string.
+
+        Each token looks like ``GE1/0/1(D)`` or ``GE1/0/2(U)``.  The trailing
+        ``(U)``/``(D)`` link-state suffix is stripped.
+        """
+        ports = []
+        for token in ports_str.split():
+            port = re.sub(r"\([UD]\)$", "", token)
+            if port:
+                ports.append(port)
+        return ports
 
     @staticmethod
     def _get_vlans_parse_interfaces(interfaces):
