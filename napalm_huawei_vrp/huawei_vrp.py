@@ -1915,35 +1915,101 @@ class VRPDriver(NetworkDriver):
 
         return local_users
 
-    # developing
     def get_vlans(self):
-        pass
-        """
-        {
-            "1": {
-                "name": "default",
-                "interfaces": [
-                    "GigabitEthernet0/9",
-                    "GigabitEthernet0/12",
-                    "GigabitEthernet0/22",
-                    "GigabitEthernet0/25",
-                    "TenGigabitEthernet0/1",
-                    "TenGigabitEthernet0/2"
-                ]
-            },
-            "603": {
-                "name": "Kuku",
-                "interfaces": [
-                    "GigabitEthernet0/10"
-                ]
-            "800": {
-                "name": "coopero",
-                "interfaces": [
-                    "GigabitEthernet0/19"
-                ]
+        """Return VLANs configured on the device.
+
+        The return value follows the NAPALM ``get_vlans`` schema::
+
+            {
+                "1": {
+                    "name": "default",
+                    "interfaces": ["TenGigabitEthernet1/2/15"]
+                }
             }
-        }
         """
+        vlans = {}
+        command = "show vlan all-ports"
+        output = self.device.send_command(command)
+
+        if not output:
+            return vlans
+
+        current_vlan = None
+
+        for line in output.splitlines():
+            # Ignore headers, separators, blank lines, and the second VLAN metadata
+            # table that follows the ports table on some platforms.
+            if (
+                not line.strip()
+                or line.startswith("VLAN Name")
+                or line.startswith("----")
+                or line.startswith("VLAN Type")
+            ):
+                current_vlan = None
+                continue
+
+            vlan_match = re.match(
+                r"^(?P<vlan_id>\d+)\s+(?P<name>\S+)\s+"
+                r"(?P<status>active|act/unsup|suspend|suspended)\s*(?P<ports>.*)$",
+                line,
+            )
+
+            if vlan_match is not None:
+                vlan_id = vlan_match.group("vlan_id")
+                vlans[vlan_id] = {
+                    "name": vlan_match.group("name"),
+                    "interfaces": self._get_vlans_parse_interfaces(
+                        vlan_match.group("ports")
+                    ),
+                }
+                current_vlan = vlan_id
+                continue
+
+            # Port lists can wrap onto indented continuation lines.
+            if current_vlan is not None and line.startswith(" "):
+                vlans[current_vlan]["interfaces"].extend(
+                    self._get_vlans_parse_interfaces(line.strip())
+                )
+
+        return vlans
+
+    @staticmethod
+    def _get_vlans_parse_interfaces(interfaces):
+        """Parse and normalize a comma-separated VLAN interface list."""
+        normalized_interfaces = []
+
+        if not interfaces:
+            return normalized_interfaces
+
+        interface_map = {
+            "Eth": "Ethernet",
+            "Fa": "FastEthernet",
+            "Gi": "GigabitEthernet",
+            "Te": "TenGigabitEthernet",
+            "Po": "Port-channel",
+        }
+
+        for interface in interfaces.split(","):
+            interface = interface.strip()
+
+            if not interface:
+                continue
+
+            interface_match = re.match(
+                r"^(?P<prefix>[A-Za-z-]+)(?P<number>.+)$", interface
+            )
+
+            if interface_match is None:
+                normalized_interfaces.append(interface)
+                continue
+
+            prefix = interface_match.group("prefix")
+            number = interface_match.group("number")
+            normalized_interfaces.append(
+                "{}{}".format(interface_map.get(prefix, prefix), number)
+            )
+
+        return normalized_interfaces
 
     @staticmethod
     def _separate_section(separator, content):
